@@ -1,8 +1,12 @@
 from __future__ import print_function
+import os
+import string
 import boto3
 import json
 import urllib
 import re
+from random import SystemRandom
+
 
 reporter_dict = {
     "WA": "1",
@@ -11,6 +15,78 @@ reporter_dict = {
     "FL": "4",
     "MI": "5"
 }
+
+
+def create_es_domain(client, host):
+    """
+    Create Elasticsearch service with random hostname (potentially configurable),
+    and default config for now
+    """
+    response = client.create_elasticsearch_domain(
+        DomainName=host,
+        ElasticsearchVersion='5.3',
+        ElasticsearchClusterConfig={
+            'InstanceType': 't2.small.elasticsearch',
+            'InstanceCount': 3,
+            'DedicatedMasterEnabled': False,
+            'ZoneAwarenessEnabled': False
+        },
+        EBSOptions={
+            'EBSEnabled': True,
+            'VolumeType': 'standard',
+            'VolumeSize': 10
+        },
+        AccessPolicies='arn:aws:iam::{}:role/GeocoderRole'.format(os.getenv('AWS_ACCOUNT')),
+        SnapshotOptions={
+            'AutomatedSnapshotStartHour': 0
+        }
+    )
+
+
+def submit_load_elasticsearch(client, host, bucket, state_name, depends_on):
+    """
+    Run es_tiger_loader.py as normal, will need S3 bucket with information as var
+    """
+    command = {'command': ['es_tiger_loader.py', state_name, '-h', host, '-b', bucket]}
+
+    job_submit_result = client.submit_job(
+        jobName='LoadElasticsearchTBD',
+        jobQueue='National-Voter-File-Job-Queue',
+        jobDefinition='Geocoder',
+        containerOverrides=command
+    )
+
+    job_id = job_submit_result['jobId']
+    return job_id
+
+
+def submit_run_geocoder_job(client, host, bucket, key, state_name, depends_on):
+    """
+    Run run.py to actually geocode results
+    - Need to pass --s3_bucket parameter with the bucket where output will be stored
+    - Can also include full S3 path to key because path will be split and put in
+      data/ in processing
+    """
+    output_file = '.'.join(key.split('.')[:-1]) + '_output.' + key.split('.')[-1]
+    command = {'command': ['run.py', key, '-o', output_file, '-s', state_name, '-b', bucket, '-h', host]}
+
+    job_submit_result = client.submit_job(
+        jobName='LoadElasticsearchTBD',
+        jobQueue='National-Voter-File-Job-Queue',
+        jobDefinition='Geocoder',
+        containerOverrides=command,
+        dependsOn=depends_on
+    )
+
+    job_id = job_submit_result['jobId']
+    return job_id
+
+
+def delete_elasticsearch(client, host, depends_on):
+    """
+    Can this be a short command queue to run at end? Does it have to be added to the container?
+    """
+    response = client.delete_elasticsearch_domain(DomainName=host)
 
 
 def submit_file_copy_job(client, bucket, key):
@@ -70,8 +146,19 @@ def submit_load_job(batch_client, input_file, state_name, report_date, reporter,
     return job_submit_result['jobId']
 
 
+def run_geocoder_tasks(batch_client, es_client, bucket, key, state_name):
+    rand_str = ''.join(SystemRandom().choice(string.ascii_lowercase + string.digits) for _ in range(6))
+    es_host = 'geocoder-{}'.format(rand_str)
+    create_es_domain(es_host)
+    # nvf-tiger-2016 bucket is static, can be moved
+    load_job = submit_load_elasticsearch(batch_client, es_host, 'nvf-tiger-2016', state_name, {})
+    geocode_job = submit_run_geocoder_job(batch_client, es_host, bucket, key, state_name, {'jobId': load_job})
+
+
+
 def lambda_handler(event, context):
     batch_client = boto3.client('batch')
+    es_client = boto3.client('es')
     """:type: pyboto3.batch"""
 
     s3 = boto3.resource('s3')
