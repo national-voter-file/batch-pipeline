@@ -1,8 +1,9 @@
 from __future__ import print_function
 import boto3
-import json
 import urllib
 import re
+import os.path
+
 
 reporter_dict = {
     "WA": "1",
@@ -24,8 +25,14 @@ def submit_file_copy_job(client, bucket, key):
     return job_id
 
 
-def submit_unzip_job(client, input_file, dependsOn):
-    command = {"command": ["sh", "-cxv", "gunzip -f "+input_file]}
+def submit_unzip_job(client, input_file, extension, dependsOn):
+
+    if extension == '.gz':
+        command = {"command": ["sh", "-cxv", "gunzip -f "+input_file]}
+    elif extension == '.zip':
+        command = {"command": ["sh", "-cxv", "unzip -f "+input_file]}
+    else:
+        raise Exception("Unrecognized compressed file extension: "+extension)
 
     job_submit_result = client.submit_job(jobName='UnzipVoterFile', jobQueue='National-Voter-File-Job-Queue',dependsOn=dependsOn,
                                           jobDefinition='BusyBox', containerOverrides=command)
@@ -51,7 +58,7 @@ def submit_precinct_job(batch_client, input_file, state_name, report_date, depen
                     state_name, "--input_file",
                     input_file, "precincts"]}
 
-    job_submit_result = batch_client.submit_job(jobName='LoadPrecints' + state_name + report_date,
+    job_submit_result = batch_client.submit_job(jobName='LoadPrecincts' + state_name + report_date,
                                                 jobQueue='National-Voter-File-Job-Queue',
                                                 jobDefinition='ETL', dependsOn=dependsOn,
                                                 containerOverrides=xform_command)
@@ -69,6 +76,17 @@ def submit_load_job(batch_client, input_file, state_name, report_date, reporter,
                                                 containerOverrides=xform_command)
     return job_submit_result['jobId']
 
+
+def submit_vote_history_job(batch_client, input_file, state_name, report_date, reporter, dependsOn):
+    xform_command = {"command": ["--configfile", "/work/load_conf.json", "--update_jndi", "--report_date", report_date,
+                                 "--reporter_key", reporter, "-s", state_name, "--input_file",
+                                 input_file, "history"]}
+
+    job_submit_result = batch_client.submit_job(jobName='LoadVoterHistory' + state_name + report_date,
+                                                jobQueue='National-Voter-File-Job-Queue',
+                                                jobDefinition='ETL', dependsOn=dependsOn,
+                                                containerOverrides=xform_command)
+    return job_submit_result['jobId']
 
 def lambda_handler(event, context):
     batch_client = boto3.client('batch')
@@ -102,7 +120,11 @@ def lambda_handler(event, context):
 
     input_file = "/work/" + key
 
-    # Unzip the file once it is copied (if neccessary)
+    # Unzip the file once it is copied (if necessary)
+    (base_file, extension) = os.path.splitext(input_file)
+    if extension == '.gz' or extension == '.zip':
+        file_ready_job = submit_unzip_job(batch_client, input_file, extension, [{'jobId': cp_job}])
+
     if input_file.endswith('gz'):
         file_ready_job = submit_unzip_job(batch_client, input_file, [{'jobId': cp_job}])
         m = re.match("(.*)\\.gz$", input_file)
