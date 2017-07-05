@@ -17,43 +17,36 @@ reporter_dict = {
 }
 
 
-def create_es_domain(client, host):
+def submit_create_es_domain(client, host):
     """
     Create Elasticsearch service with random hostname (potentially configurable),
     and default config for now
     """
-    response = client.create_elasticsearch_domain(
-        DomainName=host,
-        ElasticsearchVersion='5.3',
-        ElasticsearchClusterConfig={
-            'InstanceType': 't2.small.elasticsearch',
-            'InstanceCount': 3,
-            'DedicatedMasterEnabled': False,
-            'ZoneAwarenessEnabled': False
-        },
-        EBSOptions={
-            'EBSEnabled': True,
-            'VolumeType': 'standard',
-            'VolumeSize': 10
-        },
-        AccessPolicies='arn:aws:iam::{}:role/GeocoderRole'.format(os.getenv('AWS_ACCOUNT')),
-        SnapshotOptions={
-            'AutomatedSnapshotStartHour': 0
-        }
-    )
-
-
-def submit_load_elasticsearch(client, host, bucket, state_name, depends_on):
-    """
-    Run es_tiger_loader.py as normal, will need S3 bucket with information as var
-    """
-    command = {'command': ['es_tiger_loader.py', state_name, '-h', host, '-b', bucket]}
+    command = {'command': ['es.py', host, '-j', 'create', '-a', os.getenv('AWS_ACCOUNT')]}
 
     job_submit_result = client.submit_job(
         jobName='LoadElasticsearchTBD',
         jobQueue='National-Voter-File-Job-Queue',
         jobDefinition='Geocoder',
         containerOverrides=command
+    )
+
+    job_id = job_submit_result['jobId']
+    return job_id
+
+
+def submit_load_elasticsearch(client, host, bucket, state_name, depends_on):
+    """
+    Run es_tiger_loader.py as normal, will need S3 bucket with information as var
+    """
+    command = {'command': ['es_tiger_loader.py', state_name, '-e', host, '-b', bucket]}
+
+    job_submit_result = client.submit_job(
+        jobName='LoadElasticsearchTBD',
+        jobQueue='National-Voter-File-Job-Queue',
+        jobDefinition='Geocoder',
+        containerOverrides=command,
+        dependsOn=depends_on
     )
 
     job_id = job_submit_result['jobId']
@@ -68,7 +61,7 @@ def submit_run_geocoder_job(client, host, bucket, key, state_name, depends_on):
       data/ in processing
     """
     output_file = '.'.join(key.split('.')[:-1]) + '_output.' + key.split('.')[-1]
-    command = {'command': ['run.py', key, '-o', output_file, '-s', state_name, '-b', bucket, '-h', host]}
+    command = {'command': ['run.py', key, '-o', output_file, '-s', state_name, '-b', bucket, '-e', host]}
 
     job_submit_result = client.submit_job(
         jobName='LoadElasticsearchTBD',
@@ -82,11 +75,24 @@ def submit_run_geocoder_job(client, host, bucket, key, state_name, depends_on):
     return job_id
 
 
-def delete_elasticsearch(client, host, depends_on):
+def submit_delete_elasticsearch(client, host, depends_on):
     """
     Can this be a short command queue to run at end? Does it have to be added to the container?
     """
     response = client.delete_elasticsearch_domain(DomainName=host)
+
+    command = {'command': ['es.py', host, '-j', 'delete', '-a', os.getenv('AWS_ACCOUNT')]}
+
+    job_submit_result = client.submit_job(
+        jobName='LoadElasticsearchTBD',
+        jobQueue='National-Voter-File-Job-Queue',
+        jobDefinition='Geocoder',
+        containerOverrides=command,
+        dependsOn=depends_on
+    )
+
+    job_id = job_submit_result['jobId']
+    return job_id
 
 
 def submit_file_copy_job(client, bucket, key):
@@ -149,11 +155,11 @@ def submit_load_job(batch_client, input_file, state_name, report_date, reporter,
 def run_geocoder_tasks(batch_client, es_client, bucket, key, state_name):
     rand_str = ''.join(SystemRandom().choice(string.ascii_lowercase + string.digits) for _ in range(6))
     es_host = 'geocoder-{}'.format(rand_str)
-    create_es_domain(es_host)
+    create_es_job = submit_create_es_domain(batch_client, es_host)
     # nvf-tiger-2016 bucket is static, can be moved
-    load_job = submit_load_elasticsearch(batch_client, es_host, 'nvf-tiger-2016', state_name, {})
+    load_job = submit_load_elasticsearch(batch_client, es_host, 'nvf-tiger-2016', state_name, {'jobId': create_es_job})
     geocode_job = submit_run_geocoder_job(batch_client, es_host, bucket, key, state_name, {'jobId': load_job})
-
+    delete_job = submit_delete_elasticsearch(batch_client, es_host, {'jobId': geocode_job})
 
 
 def lambda_handler(event, context):
